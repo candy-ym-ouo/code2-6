@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   advanceDay,
   createInitialState,
+  getOpenLetters,
   previewPlan,
   relationKey
 } from '../engine.js';
@@ -100,7 +101,19 @@ test('十四日结算会进入明确终局而不是无限循环', () => {
   while (state.phase === 'planning') {
     state.reputation = 100;
     for (const letter of state.letters.filter((item) => ['inbox', 'backlog'].includes(item.status))) {
-      letter.lastPenaltyDay = state.day;
+      if (!state.penaltyLedger.some((entry) => entry.day === state.day && entry.letterId === letter.id)) {
+        state.penaltyLedger.push({
+          key: `${state.day}:${letter.id}`,
+          day: state.day,
+          letterId: letter.id,
+          urgency: letter.urgency,
+          backlogSince: letter.backlogSince ?? state.day,
+          reputationDelta: 0,
+          creditsDelta: 0,
+          reason: '测试预设免罚',
+          recordedAt: null
+        });
+      }
     }
     advanceDay(state, []);
   }
@@ -200,4 +213,140 @@ test('信誉降到零会进入失败终局并停止生成下一日邮件', () =>
   assert.equal(state.phase, 'failed');
   assert.equal(state.ending.type, 'failed');
   assert.equal(state.ending.rank, 'D');
+});
+
+test('积压罚则按 结算日×信件 幂等入账，重放结算不会重复扣分', () => {
+  const state = createInitialState({ seed: 'ledger-idempotent' });
+  const dayOneLetters = [...state.letters];
+  const report = advanceDay(state, []);
+
+  assert.equal(report.backlogPenalties.length, dayOneLetters.length);
+  assert.equal(state.penaltyLedger.length, dayOneLetters.length);
+  for (const letter of dayOneLetters) {
+    const entries = state.penaltyLedger.filter((entry) => entry.letterId === letter.id);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].day, 1);
+    assert.equal(entries[0].key, `1:${letter.id}`);
+  }
+
+  // 模拟崩溃后重放：同一结算日的条目已在台账中时，投影与落账都不再产生罚分。
+  const replayState = createInitialState({ seed: 'ledger-idempotent' });
+  for (const item of replayState.letters) {
+    replayState.penaltyLedger.push({
+      key: `1:${item.id}`,
+      day: 1,
+      letterId: item.id,
+      urgency: item.urgency,
+      backlogSince: 1,
+      reputationDelta: -1,
+      creditsDelta: -1,
+      reason: '崩溃重放预设',
+      recordedAt: null
+    });
+  }
+  const replayPreview = previewPlan(replayState, []);
+  assert.equal(replayPreview.projection.backlogPenalties.length, 0);
+  assert.equal(replayPreview.projection.reputationDelta, 0);
+  assert.equal(replayPreview.projection.creditsDelta, 0);
+
+  const reputationBefore = replayState.reputation;
+  const creditsBefore = replayState.credits;
+  const replayReport = advanceDay(replayState, []);
+  assert.equal(replayReport.backlogPenalties.length, 0);
+  assert.equal(replayState.reputation, reputationBefore);
+  assert.equal(replayState.credits, creditsBefore);
+  assert.equal(replayState.penaltyLedger.length, dayOneLetters.length);
+});
+
+test('积压信件跨日继续受罚但每个结算日只入账一次', () => {
+  const state = createInitialState({ seed: 'ledger-multi-day' });
+  const dayOneIds = new Set(state.letters.map((letter) => letter.id));
+  advanceDay(state, []); // 第 1 日全部积压
+  const firstDayCount = state.penaltyLedger.length;
+  const reputationAfterDayOne = state.reputation;
+
+  const report = advanceDay(state, []); // 第 2 日仍全部积压
+  assert.equal(state.day, 3);
+  // 第 2 日罚则 = 第 1 日积压件 + 第 2 日新邮件；第 1 日信件各有 2 条（每日一条）。
+  assert.ok(report.backlogPenalties.length > firstDayCount);
+  for (const letterId of dayOneIds) {
+    const entries = state.penaltyLedger.filter((entry) => entry.letterId === letterId);
+    assert.equal(entries.length, 2);
+    assert.deepEqual(entries.map((entry) => entry.day), [1, 2]);
+  }
+  assert.ok(state.reputation < reputationAfterDayOne);
+
+  const keys = state.penaltyLedger.map((entry) => entry.key);
+  assert.equal(new Set(keys).size, keys.length);
+});
+
+test('加急件超期后次日仍可补排，并保留可追索原因与完整历史链', () => {
+  const state = createInitialState({ seed: 'urgent-trace' });
+  const letter = state.letters[0];
+  letter.urgency = 3;
+  letter.sealColor = 'seal-red';
+
+  // 第 1 日未安排，加急件超期积压。
+  advanceDay(state, []);
+  const backlogged = state.letters.find((item) => item.id === letter.id);
+  assert.equal(backlogged.status, 'backlog');
+  assert.equal(backlogged.backlogSince, 1);
+  assert.ok(backlogged.timeline.some((event) => event.type === 'backlogged' && event.day === 1));
+
+  // 次日仍可安排这封加急件。
+  const assignment = {
+    letterId: letter.id,
+    courierId: 'comet',
+    targetIslandId: letter.recipientIslandId,
+    order: 0
+  };
+  const preview = previewPlan(state, [assignment]);
+  assert.equal(preview.valid, true);
+  const projected = preview.routes[0].letters[0];
+  assert.equal(projected.backlogDays, 1);
+  assert.equal(projected.late, true);
+  assert.ok(projected.lateReason);
+  assert.equal(projected.lateReason.primary, 'backlog');
+  assert.ok(projected.lateReason.overdueHours > 0);
+  assert.ok(projected.lateReason.factors.some((factor) => factor.type === 'backlog' && factor.hours === 24));
+
+  advanceDay(state, [assignment]);
+  const delivered = state.letters.find((item) => item.id === letter.id);
+  assert.equal(delivered.status, 'delivered');
+  assert.equal(delivered.deliveredDay, 2);
+  assert.equal(delivered.outcome, 'late');
+
+  const types = delivered.timeline.map((event) => event.type);
+  assert.deepEqual(types, ['received', 'backlogged', 'penalty', 'recovered', 'delivered']);
+  const deliveredEvent = delivered.timeline.at(-1);
+  assert.ok(deliveredEvent.lateReason);
+  assert.equal(deliveredEvent.lateReason.primary, 'backlog');
+  assert.ok(deliveredEvent.lateReason.factors.length >= 2);
+
+  // 已投递的信件不再出现在待投递队列，也不会再产生积压罚则。
+  assert.equal(getOpenLetters(state).some((item) => item.id === letter.id), false);
+  assert.equal(state.penaltyLedger.filter((entry) => entry.letterId === letter.id).length, 1);
+});
+
+test('同日加急超期的追索原因可归因到航段因素', () => {
+  const state = createInitialState({ seed: 'same-day-factor' });
+  const letter = state.letters[0];
+  letter.urgency = 3;
+  letter.sealColor = 'seal-red';
+  letter.deadlineHour = 7;
+
+  const assignment = {
+    letterId: letter.id,
+    courierId: 'zephyr',
+    targetIslandId: letter.recipientIslandId,
+    order: 0
+  };
+  const preview = previewPlan(state, [assignment]);
+  const projected = preview.routes[0].letters[0];
+  assert.equal(projected.late, true);
+  assert.equal(projected.backlogDays, 0);
+  assert.ok(projected.lateReason.overdueHours > 0);
+  assert.notEqual(projected.lateReason.primary, 'backlog');
+  assert.ok(projected.lateReason.factors.every((factor) => Number.isFinite(factor.hours)));
+  assert.ok(projected.lateReason.factors.some((factor) => factor.type !== 'cruise'));
 });

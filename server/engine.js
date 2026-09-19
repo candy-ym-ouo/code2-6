@@ -140,6 +140,92 @@ function round(value, precision = 1) {
   return Math.round(value * scale) / scale;
 }
 
+const LATE_FACTOR_LABELS = {
+  cruise: '基准航渡',
+  load: '满载减速',
+  wind: '逆风损失',
+  gale: '风翎岛乱流',
+  mist: '雾礁岛低云',
+  sunFog: '曦光岛晨雾',
+  backlog: '跨日积压'
+};
+
+function buildLateReason(state, letter, arrivalHour, factorParts, extraFactors = []) {
+  const deadlineHour = letter.deadlineHour;
+  const factors = [];
+
+  for (const part of factorParts) {
+    if (part.type === 'cruise') {
+      factors.push({
+        type: 'cruise',
+        hours: round(part.cruiseHours, 2),
+        label: LATE_FACTOR_LABELS.cruise
+      });
+      continue;
+    }
+
+    if (part.type === 'load') {
+      const penaltyHours = part.loadedHours - part.unloadedHours;
+      if (penaltyHours > 0.005) {
+        factors.push({
+          type: 'load',
+          hours: round(penaltyHours, 2),
+          label: LATE_FACTOR_LABELS.load,
+          detail: `装载率 ${Math.round(part.loadRatio * 100)}%（${part.segment}）`
+        });
+      }
+    } else if (part.type === 'wind') {
+      if (part.windHours > part.noWindHours + 0.005) {
+        const angleDegrees = Math.round(Math.acos(Math.min(1, Math.max(-1, part.alignment))) * 180 / Math.PI);
+        factors.push({
+          type: 'wind',
+          hours: round(part.windHours - part.noWindHours, 2),
+          label: LATE_FACTOR_LABELS.wind,
+          detail: `${part.segment}：${state.wind.direction} ${state.wind.strength} 级，航向差 ${angleDegrees}°`
+        });
+      }
+    } else if (part.type === 'gale') {
+      const penaltyHours = part.galeHours - part.priorHours;
+      if (penaltyHours > 0.005) {
+        factors.push({
+          type: 'gale',
+          hours: round(penaltyHours, 2),
+          label: LATE_FACTOR_LABELS.gale,
+          detail: `${part.segment} 末段航速下降 12%`
+        });
+      }
+    } else {
+      const weatherHours = part.type === 'mist' ? 0.35 : 0.25;
+      factors.push({
+        type: part.type,
+        hours: weatherHours,
+        label: LATE_FACTOR_LABELS[part.type],
+        detail: part.type === 'sunFog' ? `${part.segment} 9 点前抵达，加时 0.25 小时` : `${part.segment} 低云加时 0.35 小时`
+      });
+    }
+  }
+
+  factors.push(...extraFactors);
+
+  const ranked = factors
+    .filter((factor) => factor.type !== 'cruise' && Number.isFinite(factor.hours) && factor.hours > 0)
+    .sort((first, second) => second.hours - first.hours);
+  const primary = ranked[0]?.type || 'cruise';
+  const overdueHours = round((state.day - letter.deadlineDay) * 24 + arrivalHour - letter.deadlineHour, 2);
+
+  return {
+    deadlineDay: letter.deadlineDay,
+    deadlineHour,
+    arrivalDay: state.day,
+    arrivalHour,
+    overdueHours,
+    primary,
+    factors: factors
+      .filter((factor) => factor.type === 'cruise' || (Number.isFinite(factor.hours) && factor.hours > 0))
+      .sort((first, second) => second.hours - first.hours)
+  };
+}
+
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
@@ -208,11 +294,16 @@ export function generateLettersForDay(seed, day) {
       backlogSince: null,
       deliveredDay: null,
       deliveredTo: null,
-      outcome: null
+      outcome: null,
+      timeline: [{ type: 'received', day, atHour: null, detail: '邮件抵达天枢邮港待调度。' }]
     });
   }
 
   return letters;
+}
+
+export function penaltyEntryKey(day, letterId) {
+  return `${day}:${letterId}`;
 }
 
 function buildInitialRelations() {
@@ -257,6 +348,7 @@ export function createInitialState({ seed = Date.now(), days = 14 } = {}) {
     relations: buildInitialRelations(),
     letters,
     history: [],
+    penaltyLedger: [],
     lastReport: null,
     ending: null,
     createdAt: now,
@@ -375,18 +467,65 @@ export function calculateRoute(state, courierId, routeAssignments = []) {
     const angleDifference = (bearing - state.wind.angle) * Math.PI / 180;
     const alignment = Math.cos(angleDifference);
     const windBoost = state.wind.strength * alignment * 0.78;
-    let speed = courier.baseSpeed * (1 - 0.34 * loadRatio) + windBoost;
-    if (target.id === 'gale') speed *= 0.88;
-    speed = clamp(speed, 24, 118);
+    const legStartHour = hour;
+    const segmentName = `${current.name} → ${target.name}`;
 
+    // 逐因素分解耗时，保证累计值与原航时公式一致，并为超期追索保留证据。
+    const speedAfterLoad = courier.baseSpeed * (1 - 0.34 * loadRatio);
+    const speedAfterWind = speedAfterLoad + windBoost;
+    const speedAfterGale = target.id === 'gale' ? speedAfterWind * 0.88 : speedAfterWind;
+    const speedClamped = clamp(speedAfterGale, 24, 118);
     const weatherDelay = (target.id === 'mist' ? 0.35 : 0) + (target.id === 'sun' && hour < 9 ? 0.25 : 0);
-    const legHours = legDistance / speed + weatherDelay;
+    const legHours = legDistance / speedClamped + weatherDelay;
     hour = round(hour + legHours, 2);
     distance = round(distance + legDistance, 1);
 
     const late = state.day > assignment.letter.deadlineDay || hour > assignment.letter.deadlineHour;
     const wrong = assignment.targetIslandId !== assignment.letter.recipientIslandId;
     const outcome = wrong ? (late ? 'wrong-late' : 'wrong') : late ? 'late' : 'on-time';
+    const backlogDays = state.day > assignment.letter.day ? state.day - assignment.letter.day : 0;
+
+    let lateReason = null;
+    if (late) {
+      const factorParts = [
+        { type: 'cruise', cruiseHours: legDistance / speedClamped },
+        {
+          type: 'load',
+          segment: segmentName,
+          loadRatio,
+          unloadedHours: legDistance / courier.baseSpeed,
+          loadedHours: legDistance / speedAfterLoad
+        },
+        {
+          type: 'wind',
+          segment: segmentName,
+          alignment,
+          noWindHours: legDistance / speedAfterLoad,
+          windHours: legDistance / clamp(speedAfterWind, 24, 118)
+        }
+      ];
+      if (target.id === 'gale') {
+        factorParts.push({
+          type: 'gale',
+          segment: segmentName,
+          priorHours: legDistance / clamp(speedAfterWind, 24, 118),
+          galeHours: legDistance / speedClamped
+        });
+      }
+      if (target.id === 'mist') factorParts.push({ type: 'mist', segment: segmentName });
+      if (target.id === 'sun' && legStartHour < 9) factorParts.push({ type: 'sunFog', segment: segmentName });
+
+      const extraFactors = backlogDays > 0
+        ? [{
+            type: 'backlog',
+            hours: backlogDays * 24,
+            label: LATE_FACTOR_LABELS.backlog,
+            detail: `邮件自第 ${assignment.letter.day} 日积压，次日才安排出港，跨过 ${backlogDays} 个调度日`
+          }]
+        : [];
+
+      lateReason = buildLateReason(state, assignment.letter, hour, factorParts, extraFactors);
+    }
 
     const result = {
       letterId: assignment.letter.id,
@@ -398,9 +537,12 @@ export function calculateRoute(state, courierId, routeAssignments = []) {
       weight: assignment.letter.weight,
       urgency: assignment.letter.urgency,
       legDistance: round(legDistance, 1),
-      effectiveSpeed: round(speed, 1),
+      effectiveSpeed: round(speedClamped, 1),
       windAlignment: round(alignment, 2),
+      legStartHour,
       arrivalHour: hour,
+      backlogDays,
+      lateReason,
       outcome,
       late,
       wrong,
@@ -435,7 +577,25 @@ function emptyProjection() {
     late: 0,
     wrong: 0,
     backlog: 0,
+    backlogPenalties: [],
     relationChanges: []
+  };
+}
+
+function hasPenaltyEntry(state, day, letterId) {
+  return state.penaltyLedger.some((entry) => entry.day === day && entry.letterId === letterId);
+}
+
+function buildBacklogPenalty(state, letter) {
+  return {
+    key: penaltyEntryKey(state.day, letter.id),
+    day: state.day,
+    letterId: letter.id,
+    urgency: letter.urgency,
+    backlogSince: letter.status === 'backlog' ? letter.backlogSince : state.day,
+    reputationDelta: -urgencyPenalty(letter.urgency),
+    creditsDelta: -letter.urgency,
+    reason: letter.status === 'inbox' ? '当日未安排出港，转入积压' : '仍未安排投递，积压延续'
   };
 }
 
@@ -481,10 +641,13 @@ function collectPlanEffects(state, preparedRoutes, unassignedLetters) {
   }
 
   for (const letter of unassignedLetters) {
-    if (letter.lastPenaltyDay === state.day) continue;
     projection.backlog += 1;
-    projection.reputationDelta -= urgencyPenalty(letter.urgency);
-    projection.creditsDelta -= letter.urgency;
+    // 跨日幂等账：同一（结算日 × 信件）只入账一次，重开页面或重放结算都不会重复扣分。
+    if (hasPenaltyEntry(state, state.day, letter.id)) continue;
+    const entry = buildBacklogPenalty(state, letter);
+    projection.backlogPenalties.push(entry);
+    projection.reputationDelta += entry.reputationDelta;
+    projection.creditsDelta += entry.creditsDelta;
   }
 
   projection.reputationDelta = round(
@@ -573,15 +736,60 @@ export function advanceDay(state, rawAssignments = []) {
       letter.deliveredTo = result.targetIslandId;
       letter.outcome = result.outcome;
       letter.deliveryHour = result.arrivalHour;
+      letter.timeline = Array.isArray(letter.timeline) ? letter.timeline : [];
+      if (letter.backlogSince !== null && state.day > letter.day) {
+        letter.timeline.push({
+          type: 'recovered',
+          day: state.day,
+          atHour: result.legStartHour ?? null,
+          detail: `积压 ${state.day - letter.day} 日后重新安排出港，由${route.courierName}承运。`
+        });
+      }
+      letter.timeline.push({
+        type: 'delivered',
+        day: state.day,
+        atHour: result.arrivalHour,
+        detail: `${result.targetName}签收，结果：${result.outcome}。`,
+        lateReason: result.lateReason ?? null
+      });
     }
   }
 
+  const appliedPenaltyEntries = [];
   for (const letter of unassignedLetters) {
-    if (letter.status === 'inbox') {
+    const becameBacklog = letter.status === 'inbox';
+    if (becameBacklog) {
       letter.status = 'backlog';
       letter.backlogSince = state.day;
     }
-    letter.lastPenaltyDay = state.day;
+    letter.timeline = Array.isArray(letter.timeline) ? letter.timeline : [];
+
+    if (hasPenaltyEntry(state, state.day, letter.id)) continue;
+    const previewEntry = preview.projection.backlogPenalties.find((item) => item.letterId === letter.id);
+    const entry = {
+      ...(previewEntry || buildBacklogPenalty(state, letter)),
+      recordedAt: new Date().toISOString()
+    };
+    state.penaltyLedger.push(entry);
+    appliedPenaltyEntries.push(entry);
+
+    if (becameBacklog) {
+      letter.timeline.push({
+        type: 'backlogged',
+        day: state.day,
+        atHour: null,
+        detail: letter.urgency === 3
+          ? `加急件在截止第 ${letter.deadlineDay} 日 ${String(letter.deadlineHour).padStart(2, '0')}:00 前未能出港，已超期；次日仍可补排。`
+          : '当日未安排出港，转入积压。'
+      });
+    }
+    letter.timeline.push({
+      type: 'penalty',
+      day: state.day,
+      atHour: null,
+      ledgerKey: entry.key,
+      detail: `积压罚则入账（信誉 ${entry.reputationDelta}，邮资 ${entry.creditsDelta}）。`
+    });
   }
 
   const appliedRelationChanges = relationChanges.map((change) => {
@@ -611,6 +819,7 @@ export function advanceDay(state, rawAssignments = []) {
     creditsDelta: round(state.credits - beforeCredits, 1),
     routes: preview.routes,
     unassignedLetterIds: unassignedLetters.map((letter) => letter.id),
+    backlogPenalties: appliedPenaltyEntries.map(({ recordedAt, ...entry }) => entry),
     relationChanges: appliedRelationChanges,
     generatedNextDay,
     streak: state.streak

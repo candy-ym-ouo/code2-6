@@ -7,6 +7,16 @@ const OUTCOME = {
   'wrong-late': { label: '误投·逾时', className: 'danger' }
 };
 
+const FACTOR_LABELS = {
+  cruise: '航渡距离',
+  load: '满载减速',
+  wind: '逆风',
+  gale: '风翎岛乱流',
+  mist: '雾礁岛低云',
+  sunFog: '曦光岛晨雾',
+  backlog: '跨日积压'
+};
+
 
 function RouteLetter({ entry, index, total, game, routeResult, busy, onChangeTarget, onMove, onUnassign }) {
   const recipientIslands = game.islands.filter((island) => island.id !== 'skyport');
@@ -39,6 +49,14 @@ function RouteLetter({ entry, index, total, game, routeResult, busy, onChangeTar
           </label>
           <span>{entry.letter.weight.toFixed(1)} kg · 紧急度 {entry.letter.urgency}</span>
           {projection && <span className={`outcome ${outcome?.className || ''}`}>{outcome?.label} {formatHour(projection.arrivalHour)}</span>}
+          {projection?.late && projection.lateReason && (
+            <span className="late-cause">
+              {entry.letter.urgency === 3 && <em className="urgent-inline">加急</em>}
+              主因：{FACTOR_LABELS[projection.lateReason.primary] || projection.lateReason.primary}
+              （超 {Math.max(0, projection.lateReason.overdueHours).toFixed(1)}h）
+              {projection.backlogDays > 0 && ` · 已积压 ${projection.backlogDays} 日`}
+            </span>
+          )}
         </div>
       </div>
       <div className="route-letter-buttons">

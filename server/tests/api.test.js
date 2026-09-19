@@ -177,3 +177,44 @@ test('旧存档中的越界状态会在加载时迁移并写回', () => {
   assert.deepEqual(persisted, migrated);
   fs.rmSync(temporaryDirectory, { recursive: true, force: true });
 });
+
+test('旧存档的 lastPenaltyDay 会迁移为幂等台账并补录历史链', () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sky-post-ledger-migration-'));
+  const dataFile = path.join(temporaryDirectory, 'state.json');
+  const store = new GameStore(dataFile, { seed: 'legacy-ledger' });
+  const state = store.load();
+
+  // 构造一份"旧版"存档：无台账、无历史链，积压信件带 lastPenaltyDay。
+  const legacyLetter = state.letters[0];
+  legacyLetter.status = 'backlog';
+  legacyLetter.backlogSince = 1;
+  legacyLetter.lastPenaltyDay = 1;
+  delete legacyLetter.timeline;
+  const freshLetter = state.letters[1];
+  freshLetter.lastPenaltyDay = 1;
+  delete freshLetter.timeline;
+  delete state.penaltyLedger;
+  state.lastReport = null;
+  fs.writeFileSync(dataFile, JSON.stringify(state), 'utf8');
+
+  const migrated = new GameStore(dataFile, { seed: 'ignored' }).load();
+  assert.equal(Array.isArray(migrated.penaltyLedger), true);
+  assert.equal(migrated.penaltyLedger.length, 2);
+  assert.ok(migrated.penaltyLedger.every((entry) => entry.day === 1));
+  assert.deepEqual(
+    [...migrated.penaltyLedger.map((entry) => entry.key)].sort(),
+    [`1:${legacyLetter.id}`, `1:${freshLetter.id}`].sort()
+  );
+  for (const letter of migrated.letters.slice(0, 2)) {
+    assert.equal(letter.lastPenaltyDay, undefined);
+    assert.ok(Array.isArray(letter.timeline));
+    assert.ok(letter.timeline.some((event) => event.type === 'received'));
+  }
+  const migratedBacklog = migrated.letters.find((letter) => letter.id === legacyLetter.id);
+  assert.ok(migratedBacklog.timeline.some((event) => event.type === 'backlogged'));
+
+  // 再次加载不应重复迁移入账（幂等）。
+  const reloaded = new GameStore(dataFile, { seed: 'ignored' }).load();
+  assert.equal(reloaded.penaltyLedger.length, 2);
+  fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+});

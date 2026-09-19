@@ -265,8 +265,7 @@ function App() {
                   <p>检查下方航线并执行当日调度。</p>
                 </div>
               ) : unassignedLetters.map((letter) => (
-                <LetterCard key={letter.id} letter={letter} islands={game.islands}>
-                  {letter.status === 'backlog' && <span className="backlog-tag">已积压 {Math.max(0, game.day - letter.day)} 日</span>}
+                <LetterCard key={letter.id} letter={letter} islands={game.islands} todayDay={game.day}>
                   <div className="assign-buttons">
                     {game.couriers.map((courier) => (
                       <button key={courier.id} type="button" disabled={busy} onClick={() => assignLetter(letter, courier.id)}>

@@ -23,6 +23,15 @@ function hasValidReport(report) {
   if (!Number.isInteger(report.streak)) return false;
   if (report.generatedNextDay !== null && !Number.isInteger(report.generatedNextDay)) return false;
   if (!Array.isArray(report.routes) || !Array.isArray(report.unassignedLetterIds) || !Array.isArray(report.relationChanges)) return false;
+  if (!Array.isArray(report.backlogPenalties)) return false;
+  if (!report.backlogPenalties.every((entry) => (
+    isPlainObject(entry) &&
+    typeof entry.key === 'string' &&
+    Number.isInteger(entry.day) &&
+    typeof entry.letterId === 'string' &&
+    Number.isFinite(entry.reputationDelta) &&
+    Number.isFinite(entry.creditsDelta)
+  ))) return false;
   if (!report.unassignedLetterIds.every((letterId) => typeof letterId === 'string')) return false;
   if (!report.routes.every((route) => (
     typeof route?.courierId === 'string' &&
@@ -73,6 +82,17 @@ function hasValidStateShape(state) {
   if (!Number.isInteger(state.revision) || state.revision < 0) return false;
   if (!Array.isArray(state.islands) || !Array.isArray(state.couriers)) return false;
   if (!Array.isArray(state.letters) || !Array.isArray(state.history)) return false;
+  if (!Array.isArray(state.penaltyLedger)) return false;
+  if (!state.penaltyLedger.every((entry) => (
+    isPlainObject(entry) &&
+    typeof entry.key === 'string' &&
+    Number.isInteger(entry.day) &&
+    typeof entry.letterId === 'string' &&
+    Number.isFinite(entry.reputationDelta) &&
+    Number.isFinite(entry.creditsDelta)
+  ))) return false;
+  const ledgerKeys = new Set(state.penaltyLedger.map((entry) => entry.key));
+  if (ledgerKeys.size !== state.penaltyLedger.length) return false;
   if (!isPlainObject(state.wind) || !isPlainObject(state.relations)) return false;
   if (!hasValidReport(state.lastReport)) return false;
   if (!hasValidEnding(state.ending)) return false;
@@ -138,12 +158,79 @@ function hasValidStateShape(state) {
   return true;
 }
 
+function urgencyPenalty(urgency) {
+  return urgency === 3 ? 2 : urgency === 2 ? 1.2 : 0.6;
+}
+
+function migrateLedgerAndTimelines(parsed) {
+  let changed = false;
+
+  if (!Array.isArray(parsed.penaltyLedger)) {
+    parsed.penaltyLedger = [];
+    changed = true;
+  }
+
+  const knownKeys = new Set(parsed.penaltyLedger.map((entry) => entry?.key).filter(Boolean));
+  const seenKeys = new Set(knownKeys);
+  const dedupedLedger = [];
+
+  // 旧存档用 lastPenaltyDay 做单日防重，迁移成跨日幂等台账。
+  for (const letter of Array.isArray(parsed.letters) ? parsed.letters : []) {
+    if (!isPlainObject(letter) || typeof letter.id !== 'string') continue;
+
+    if (!Array.isArray(letter.timeline)) {
+      letter.timeline = [{ type: 'received', day: letter.day, atHour: null, detail: '邮件抵达天枢邮港待调度（历史链由旧存档补录）。' }];
+      if (letter.backlogSince !== null && Number.isInteger(letter.backlogSince)) {
+        letter.timeline.push({ type: 'backlogged', day: letter.backlogSince, atHour: null, detail: '转入积压（历史链由旧存档补录）。' });
+      }
+      if (letter.status === 'delivered' && Number.isInteger(letter.deliveredDay)) {
+        letter.timeline.push({
+          type: 'delivered',
+          day: letter.deliveredDay,
+          atHour: Number.isFinite(letter.deliveryHour) ? letter.deliveryHour : null,
+          detail: `已投递（${letter.outcome || '结果未知'}，历史链由旧存档补录）。`
+        });
+      }
+      changed = true;
+    }
+
+    if (Number.isInteger(letter.lastPenaltyDay)) {
+      const key = `${letter.lastPenaltyDay}:${letter.id}`;
+      if (!seenKeys.has(key)) {
+        dedupedLedger.push({
+          key,
+          day: letter.lastPenaltyDay,
+          letterId: letter.id,
+          urgency: letter.urgency,
+          backlogSince: Number.isInteger(letter.backlogSince) ? letter.backlogSince : letter.lastPenaltyDay,
+          reputationDelta: -urgencyPenalty(letter.urgency),
+          creditsDelta: -letter.urgency,
+          reason: '旧存档 lastPenaltyDay 迁移入账',
+          recordedAt: parsed.updatedAt || null
+        });
+        seenKeys.add(key);
+      }
+      delete letter.lastPenaltyDay;
+      changed = true;
+    }
+  }
+
+  if (dedupedLedger.length > 0) {
+    parsed.penaltyLedger.push(...dedupedLedger);
+    parsed.penaltyLedger.sort((first, second) => first.day - second.day);
+    changed = true;
+  }
+
+  return changed;
+}
+
 function normalizeStoredState(parsed) {
   if (!isPlainObject(parsed) || parsed.version !== GAME_VERSION) {
     return { state: parsed, changed: false };
   }
 
   let changed = false;
+  if (migrateLedgerAndTimelines(parsed)) changed = true;
   if (!Number.isInteger(parsed.revision)) {
     parsed.revision = 0;
     changed = true;
