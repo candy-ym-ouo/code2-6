@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { GameRuleError, createInitialState, GAME_VERSION } from './engine.js';
+import { GameRuleError, createInitialState, backlogPenaltyKey, urgencyPenalty, GAME_VERSION } from './engine.js';
 
 const VALID_PHASES = new Set(['planning', 'completed', 'failed']);
 
@@ -60,6 +60,31 @@ function hasValidEnding(ending) {
   );
 }
 
+function hasValidPenaltyLedger(ledger) {
+  if (!Array.isArray(ledger)) return false;
+  return ledger.every((entry) => (
+    isPlainObject(entry) &&
+    typeof entry.key === 'string' &&
+    typeof entry.type === 'string' &&
+    typeof entry.letterId === 'string' &&
+    Number.isInteger(entry.day) &&
+    Number.isFinite(entry.reputationDelta) &&
+    Number.isFinite(entry.creditsDelta) &&
+    typeof entry.reason === 'string'
+  ));
+}
+
+function hasValidLetterHistory(letter) {
+  if (!Array.isArray(letter.history)) return false;
+  if (!letter.history.every((event) => (
+    isPlainObject(event) &&
+    Number.isInteger(event.day) &&
+    typeof event.type === 'string' &&
+    typeof event.reason === 'string'
+  ))) return false;
+  return letter.overdueReason === undefined || letter.overdueReason === null || typeof letter.overdueReason === 'string';
+}
+
 function hasValidStateShape(state) {
   if (!isPlainObject(state)) return false;
   if (state.version !== GAME_VERSION) return false;
@@ -73,6 +98,7 @@ function hasValidStateShape(state) {
   if (!Number.isInteger(state.revision) || state.revision < 0) return false;
   if (!Array.isArray(state.islands) || !Array.isArray(state.couriers)) return false;
   if (!Array.isArray(state.letters) || !Array.isArray(state.history)) return false;
+  if (!hasValidPenaltyLedger(state.penaltyLedger)) return false;
   if (!isPlainObject(state.wind) || !isPlainObject(state.relations)) return false;
   if (!hasValidReport(state.lastReport)) return false;
   if (!hasValidEnding(state.ending)) return false;
@@ -118,7 +144,8 @@ function hasValidStateShape(state) {
     Number.isInteger(letter.deadlineHour) &&
     typeof letter.sender === 'string' &&
     typeof letter.subject === 'string' &&
-    ['inbox', 'backlog', 'delivered'].includes(letter.status)
+    ['inbox', 'backlog', 'delivered'].includes(letter.status) &&
+    hasValidLetterHistory(letter)
   ))) return false;
 
   if (!Number.isInteger(state.wind.directionIndex) || state.wind.directionIndex < 0 || state.wind.directionIndex > 7) return false;
@@ -147,6 +174,36 @@ function normalizeStoredState(parsed) {
   if (!Number.isInteger(parsed.revision)) {
     parsed.revision = 0;
     changed = true;
+  }
+  if (!Array.isArray(parsed.penaltyLedger)) {
+    parsed.penaltyLedger = [];
+    changed = true;
+  }
+  if (Array.isArray(parsed.letters)) {
+    for (const letter of parsed.letters) {
+      if (!isPlainObject(letter)) continue;
+      if (!Array.isArray(letter.history)) {
+        letter.history = [];
+        changed = true;
+      }
+      if (Number.isInteger(letter.lastPenaltyDay)) {
+        const key = backlogPenaltyKey(letter.id, letter.lastPenaltyDay);
+        if (!parsed.penaltyLedger.some((entry) => entry?.key === key)) {
+          parsed.penaltyLedger.push({
+            key,
+            type: 'backlog',
+            letterId: letter.id,
+            day: letter.lastPenaltyDay,
+            reputationDelta: -urgencyPenalty(letter.urgency),
+            creditsDelta: -letter.urgency,
+            reason: `第 ${letter.lastPenaltyDay} 日积压未出港`,
+            migrated: true
+          });
+        }
+        delete letter.lastPenaltyDay;
+        changed = true;
+      }
+    }
   }
   if (Number.isFinite(parsed.reputation)) {
     const reputation = Math.min(100, Math.max(0, parsed.reputation));

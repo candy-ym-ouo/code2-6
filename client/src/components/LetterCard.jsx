@@ -27,6 +27,19 @@ export default function LetterCard({ letter, islands, compact = false, children 
         <span><b>{letter.weight.toFixed(1)}</b> kg</span>
         <span>截止 <b>第{letter.deadlineDay}日 {String(letter.deadlineHour).padStart(2, '0')}:00</b></span>
       </div>
+      {letter.overdueReason && (
+        <p className="overdue-reason" role="note">⚠ 已超期：{letter.overdueReason}</p>
+      )}
+      {letter.history?.length > 0 && (
+        <ul className="letter-history" aria-label="邮件流转记录">
+          {letter.history.map((event, index) => (
+            <li key={`${event.day}-${event.type}-${index}`}>
+              <span>第{event.day}日</span>
+              {event.reason}
+            </li>
+          ))}
+        </ul>
+      )}
       {children && <div className="letter-actions">{children}</div>}
     </article>
   );

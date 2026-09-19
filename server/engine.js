@@ -208,7 +208,9 @@ export function generateLettersForDay(seed, day) {
       backlogSince: null,
       deliveredDay: null,
       deliveredTo: null,
-      outcome: null
+      outcome: null,
+      overdueReason: null,
+      history: []
     });
   }
 
@@ -256,6 +258,7 @@ export function createInitialState({ seed = Date.now(), days = 14 } = {}) {
     couriers: structuredClone(COURIERS),
     relations: buildInitialRelations(),
     letters,
+    penaltyLedger: [],
     history: [],
     lastReport: null,
     ending: null,
@@ -481,7 +484,7 @@ function collectPlanEffects(state, preparedRoutes, unassignedLetters) {
   }
 
   for (const letter of unassignedLetters) {
-    if (letter.lastPenaltyDay === state.day) continue;
+    if (hasBacklogPenalty(state, letter.id, state.day)) continue;
     projection.backlog += 1;
     projection.reputationDelta -= urgencyPenalty(letter.urgency);
     projection.creditsDelta -= letter.urgency;
@@ -512,8 +515,34 @@ function collectPlanEffects(state, preparedRoutes, unassignedLetters) {
   return projection;
 }
 
-function urgencyPenalty(urgency) {
+export function urgencyPenalty(urgency) {
   return urgency === 3 ? 2 : urgency === 2 ? 1.2 : 0.6;
+}
+
+export function backlogPenaltyKey(letterId, day) {
+  return `backlog:${letterId}:${day}`;
+}
+
+function getPenaltyLedger(state) {
+  return Array.isArray(state.penaltyLedger) ? state.penaltyLedger : [];
+}
+
+export function hasBacklogPenalty(state, letterId, day) {
+  const key = backlogPenaltyKey(letterId, day);
+  return getPenaltyLedger(state).some((entry) => entry?.key === key);
+}
+
+function appendLetterHistory(letter, event) {
+  if (!Array.isArray(letter.history)) letter.history = [];
+  const alreadyRecorded = letter.history.some((item) => item?.day === event.day && item?.type === event.type);
+  if (!alreadyRecorded) letter.history.push(event);
+}
+
+function describeDeliveryOutcome(result) {
+  if (result.wrong && result.late) return `误投至${result.targetName}，且超过截止（${result.deadline}）`;
+  if (result.wrong) return `误投至${result.targetName}`;
+  if (result.late) return `逾时送达，超过截止（${result.deadline}）`;
+  return '准时送达';
 }
 
 export function previewPlan(state, rawAssignments = []) {
@@ -573,15 +602,51 @@ export function advanceDay(state, rawAssignments = []) {
       letter.deliveredTo = result.targetIslandId;
       letter.outcome = result.outcome;
       letter.deliveryHour = result.arrivalHour;
+      appendLetterHistory(letter, {
+        day: state.day,
+        type: 'delivered',
+        outcome: result.outcome,
+        courierId: route.courierId,
+        courierName: route.courierName,
+        targetIslandId: result.targetIslandId,
+        targetName: result.targetName,
+        arrivalHour: result.arrivalHour,
+        reason: describeDeliveryOutcome(result)
+      });
+      if (letter.urgency === 3) letter.overdueReason = null;
     }
   }
+
+  if (!Array.isArray(state.penaltyLedger)) state.penaltyLedger = [];
+  const newPenalties = [];
 
   for (const letter of unassignedLetters) {
     if (letter.status === 'inbox') {
       letter.status = 'backlog';
       letter.backlogSince = state.day;
     }
-    letter.lastPenaltyDay = state.day;
+    appendLetterHistory(letter, {
+      day: state.day,
+      type: 'backlog',
+      reason: `第 ${state.day} 日未安排航线，积压至次日`
+    });
+    if (letter.urgency === 3) {
+      const deadline = `第 ${letter.deadlineDay} 日 ${String(letter.deadlineHour).padStart(2, '0')}:00`;
+      letter.overdueReason = `第 ${state.day} 日未安排航线，超过截止时限（${deadline}）`;
+    }
+    if (!hasBacklogPenalty(state, letter.id, state.day)) {
+      const entry = {
+        key: backlogPenaltyKey(letter.id, state.day),
+        type: 'backlog',
+        letterId: letter.id,
+        day: state.day,
+        reputationDelta: -urgencyPenalty(letter.urgency),
+        creditsDelta: -letter.urgency,
+        reason: `第 ${state.day} 日积压未出港`
+      };
+      state.penaltyLedger.push(entry);
+      newPenalties.push(entry);
+    }
   }
 
   const appliedRelationChanges = relationChanges.map((change) => {
@@ -611,6 +676,7 @@ export function advanceDay(state, rawAssignments = []) {
     creditsDelta: round(state.credits - beforeCredits, 1),
     routes: preview.routes,
     unassignedLetterIds: unassignedLetters.map((letter) => letter.id),
+    penalties: newPenalties,
     relationChanges: appliedRelationChanges,
     generatedNextDay,
     streak: state.streak

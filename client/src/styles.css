@@ -775,6 +775,40 @@ code {
   font-size: 10px;
 }
 
+.overdue-reason {
+  margin-top: 10px;
+  padding: 7px 9px;
+  border: 1px solid rgba(255, 123, 123, 0.28);
+  border-radius: 8px;
+  color: #ffc4c4;
+  background: rgba(255, 123, 123, 0.07);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.letter-history {
+  display: grid;
+  gap: 4px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-left: 2px solid rgba(84, 215, 232, 0.25);
+  border-radius: 0 8px 8px 0;
+  background: rgba(255, 255, 255, 0.02);
+  list-style: none;
+}
+
+.letter-history li {
+  color: #8fa8bc;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.letter-history li span {
+  margin-right: 6px;
+  color: var(--cyan);
+  font-weight: 700;
+}
+
 .inbox-empty {
   display: grid;
   min-height: 220px;
@@ -1263,6 +1297,39 @@ code {
 
 .report-warning h3 {
   color: #ffadad;
+}
+
+.penalty-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  list-style: none;
+}
+
+.penalty-list li {
+  display: grid;
+  grid-template-columns: 64px 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 7px 10px;
+  border: 1px solid rgba(255, 173, 173, 0.18);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 10px;
+}
+
+.penalty-list code {
+  color: #ffb8b8;
+}
+
+.penalty-list span {
+  color: #c9a9a9;
+}
+
+.penalty-list b {
+  color: #ffd9d9;
+  font-size: 9px;
+  white-space: nowrap;
 }
 
 .relation-change {

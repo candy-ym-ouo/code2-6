@@ -74,6 +74,17 @@ export default function ReportDialog({ report, onClose }) {
             <div className="report-section report-warning">
               <h3>积压邮件</h3>
               <p>{report.unassignedLetterIds.join('、')} 未出港，信誉与邮资已受到影响。</p>
+              {report.penalties?.length > 0 && (
+                <ul className="penalty-list">
+                  {report.penalties.map((penalty) => (
+                    <li key={penalty.key}>
+                      <code>{penalty.letterId}</code>
+                      <span>{penalty.reason}</span>
+                      <b>信誉 {penalty.reputationDelta} · 邮资 {penalty.creditsDelta}</b>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
           )}
         </div>

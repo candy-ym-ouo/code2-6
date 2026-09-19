@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createApp } from '../app.js';
+import { advanceDay, previewPlan } from '../engine.js';
 import { GameStore } from '../store.js';
 
 test('HTTP API 完成读取、预览、结算和重置闭环', async (context) => {
@@ -59,6 +60,9 @@ test('HTTP API 完成读取、预览、结算和重置闭环', async (context) =
   assert.equal(advanceResponse.body.state.day, 2);
   assert.equal(advanceResponse.body.state.revision, 1);
   assert.equal(advanceResponse.body.report.day, 1);
+  assert.ok(Array.isArray(advanceResponse.body.report.penalties));
+  assert.equal(advanceResponse.body.report.penalties.length, game.letters.length - 1);
+  assert.equal(advanceResponse.body.state.penaltyLedger.length, game.letters.length - 1);
 
   const duplicateAdvance = await request('/api/game/day/advance', {
     method: 'POST',
@@ -175,5 +179,56 @@ test('旧存档中的越界状态会在加载时迁移并写回', () => {
   assert.equal(migrated.credits, 0);
   assert.equal(migrated.relations['gale:sun'], 100);
   assert.deepEqual(persisted, migrated);
+  fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+});
+
+test('旧存档的积压防重标记会迁移为跨日幂等账条目', () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sky-post-ledger-migration-'));
+  const dataFile = path.join(temporaryDirectory, 'state.json');
+  const store = new GameStore(dataFile, { seed: 'ledger-migration' });
+  const state = store.load();
+
+  // 模拟旧版本存档：没有账本与历史链，只有信件上的单日防重标记。
+  delete state.penaltyLedger;
+  const letter = state.letters[0];
+  letter.status = 'backlog';
+  letter.lastPenaltyDay = 1;
+  for (const item of state.letters) delete item.history;
+  fs.writeFileSync(dataFile, JSON.stringify(state), 'utf8');
+
+  const migrated = new GameStore(dataFile, { seed: 'ignored' }).load();
+  const migratedLetter = migrated.letters.find((item) => item.id === letter.id);
+
+  assert.ok(Array.isArray(migrated.penaltyLedger));
+  assert.equal(migrated.penaltyLedger.length, 1);
+  assert.equal(migrated.penaltyLedger[0].key, `backlog:${letter.id}:1`);
+  assert.equal(migrated.penaltyLedger[0].type, 'backlog');
+  assert.equal(migrated.penaltyLedger[0].migrated, true);
+  assert.equal(migratedLetter.lastPenaltyDay, undefined);
+  assert.ok(migrated.letters.every((item) => Array.isArray(item.history)));
+  fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+});
+
+test('结算落盘后重开存档，重放同一日不会重复计扣积压惩罚', () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sky-post-reopen-'));
+  const dataFile = path.join(temporaryDirectory, 'state.json');
+  const store = new GameStore(dataFile, { seed: 'reopen-seed' });
+  store.load();
+  store.mutate((state) => advanceDay(state, []));
+  const settled = store.getState();
+  assert.ok(settled.penaltyLedger.length > 0);
+
+  // 重开页面 = 新 Store 实例从磁盘恢复；即使同一日被异常重放，账本也阻止重复扣减。
+  const reopenedStore = new GameStore(dataFile, { seed: 'ignored' });
+  const reopenedState = reopenedStore.load();
+  assert.equal(reopenedState.penaltyLedger.length, settled.penaltyLedger.length);
+  assert.equal(reopenedState.reputation, settled.reputation);
+
+  reopenedState.day = 1;
+  reopenedState.letters = reopenedState.letters.filter((letter) => letter.day === 1);
+  const replay = previewPlan(reopenedState, []);
+  assert.equal(replay.projection.backlog, 0);
+  assert.equal(replay.projection.reputationDelta, 0);
+  assert.equal(replay.projection.creditsDelta, 0);
   fs.rmSync(temporaryDirectory, { recursive: true, force: true });
 });
